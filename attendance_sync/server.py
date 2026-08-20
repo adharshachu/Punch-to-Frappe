@@ -15,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, time as datetime_time, timezone
+from datetime import datetime, timedelta, time as datetime_time, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -51,6 +51,33 @@ _push_lock = threading.Lock()
 
 # Wakes the server loop for shutdown.
 _wake_event = threading.Event()
+
+# Caps how many HTTP requests are handled at once so dashboard polls and API
+# floods cannot exhaust memory on a small server.
+_MAX_CONCURRENT_REQUESTS = 24
+_request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
+
+# Default window for the attendance overview when no date range is requested,
+# so an unfiltered dashboard view can never load the whole event table.
+_OVERVIEW_DEFAULT_DAYS = 90
+
+# Resident-memory safety net for small servers. LOG_LEVEL can be tuned, and
+# AUTO_RESTART_ON_HIGH_MEMORY=1 exits cleanly so the container manager restarts.
+_MEMORY_WARN_MB = int(_os.environ.get("MEMORY_WARN_MB", "700") or "700")
+_MEMORY_RESTART_MB = int(_os.environ.get("MEMORY_RESTART_MB", "1100") or "1100")
+_MEMORY_RESTART_ENABLED = (_os.environ.get("AUTO_RESTART_ON_HIGH_MEMORY", "0") or "0").lower() in {"1", "true", "yes"}
+
+
+def process_rss_mb() -> int:
+    """Return current resident set size of this process in megabytes."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError):
+        return 0
+    return 0
 
 _DASHBOARD_HTML_PATH = Path(__file__).resolve().parent / "dashboard.html"
 _OPENAPI_JSON_PATH = Path(__file__).resolve().parent / "openapi.json"
@@ -666,7 +693,7 @@ def _live_attendance_payload(
     refresh_frappe: bool,
 ) -> dict[str, Any]:
     today = live_calendar_today()
-    events = store.live_attendance_source_events()
+    events = store.live_attendance_source_events(date=today)
     employee_map = settings.load_employee_map()
     device_ids = {str(event.get("employee") or "").strip() for event in events}
     mapped_ids = [
@@ -700,7 +727,7 @@ def _hr_verification_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     employee_map = settings.load_employee_map()
     overview = _filter_attendance_overview(
-        store.attendance_overview(limit=None),
+        store.attendance_overview(limit=None, date_from=date_from or None, date_to=date_to or None),
         "",
         date_from,
         date_to,
@@ -884,11 +911,16 @@ class EventIngestHandler(BaseHTTPRequestHandler):
     # ── routing ──────────────────────────────────────────────────────────────
 
     def do_GET(self) -> None:
+        if not _request_slots.acquire(blocking=False):
+            self._safe_json_response(503, {"ok": False, "error": "server_at_capacity"})
+            return
         try:
             self._dispatch_get()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled GET %s failed", self.path)
             self._safe_json_response(500, {"ok": False, "error": str(exc)})
+        finally:
+            _request_slots.release()
 
     def _dispatch_get(self) -> None:
         parsed = urlparse(self.path)
@@ -941,7 +973,10 @@ class EventIngestHandler(BaseHTTPRequestHandler):
             search = (query.get("search") or [""])[0].strip()
             date_from = (query.get("from") or [""])[0].strip()
             date_to = (query.get("to") or [""])[0].strip()
-            all_rows = self.store.attendance_overview(limit=None)
+            if not date_from and not date_to:
+                date_to = live_calendar_today()
+                date_from = (datetime.fromisoformat(date_to) - timedelta(days=_OVERVIEW_DEFAULT_DAYS)).isoformat()[:10]
+            all_rows = self.store.attendance_overview(limit=None, date_from=date_from or None, date_to=date_to or None)
             filtered_rows = _filter_attendance_overview(all_rows, search, date_from, date_to)
             total = len(filtered_rows)
             start = (page - 1) * page_size
@@ -1034,11 +1069,16 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         _json_response(self, 404, {"error": "not_found"})
 
     def do_POST(self) -> None:
+        if not _request_slots.acquire(blocking=False):
+            self._safe_json_response(503, {"ok": False, "error": "server_at_capacity"})
+            return
         try:
             self._dispatch_post()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled POST %s failed", self.path)
             self._safe_json_response(500, {"ok": False, "error": str(exc)})
+        finally:
+            _request_slots.release()
 
     def _dispatch_post(self) -> None:
         if self.path == "/events":
@@ -1223,6 +1263,10 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         counts = self.store.inbound_counts()
         payload = {
             "now": datetime.now(timezone.utc).isoformat(),
+            "process": {
+                "pid": _os.getpid(),
+                "rss_mb": process_rss_mb(),
+            },
             "server": {
                 "host": settings.SERVER_HOST,
                 "port": settings.SERVER_PORT,
@@ -1310,8 +1354,9 @@ def main() -> None:
     uptime_alert_state: dict[str, bool] = {}
     uptime_monitor_started_at = datetime.now(timezone.utc)
     last_uptime_check_monotonic = 0.0
+    last_memory_check_monotonic = 0.0
     logger.info(
-        "Central sync server listening on %s:%d; dashboard at http://%s:%d/ | auto Frappe push=%s at %s (%s) | uptime monitor=%s threshold=%sh",
+        "Central sync server listening on %s:%d; dashboard at http://%s:%d/ | auto Frappe push=%s at %s (%s) | uptime monitor=%s threshold=%sh | rss=%dMB",
         settings.SERVER_HOST, settings.SERVER_PORT,
         settings.SERVER_HOST, settings.SERVER_PORT,
         "enabled" if settings.FRAPPE_AUTO_PUSH_ENABLED else "disabled",
@@ -1319,6 +1364,7 @@ def main() -> None:
         settings.FRAPPE_AUTO_PUSH_TIMEZONE or "server local time",
         "enabled" if settings.NODE_UPTIME_MONITOR_ENABLED else "disabled",
         settings.NODE_UPTIME_THRESHOLD_HOURS,
+        process_rss_mb(),
     )
 
     try:
@@ -1336,6 +1382,24 @@ def main() -> None:
                     snapshot = _check_node_uptime(store, uptime_alert_state, uptime_monitor_started_at)
                     with _uptime_monitor_lock:
                         _uptime_monitor.update(snapshot)
+            now_monotonic = time.monotonic()
+            if now_monotonic - last_memory_check_monotonic >= 60:
+                last_memory_check_monotonic = now_monotonic
+                rss_mb = process_rss_mb()
+                if rss_mb >= _MEMORY_RESTART_MB and _MEMORY_RESTART_ENABLED:
+                    logger.critical(
+                        "Memory at %d MB (>= restart threshold %d MB); restarting cleanly. "
+                        "Pending events will be re-processed after restart.",
+                        rss_mb, _MEMORY_RESTART_MB,
+                    )
+                    _running = False
+                    _wake_event.set()
+                elif rss_mb >= _MEMORY_WARN_MB:
+                    logger.warning(
+                        "Memory at %d MB (>= warn threshold %d MB). Consider restarting the service "
+                        "or enabling AUTO_RESTART_ON_HIGH_MEMORY=1.",
+                        rss_mb, _MEMORY_WARN_MB,
+                    )
             _wake_event.wait(timeout=30.0 if settings.FRAPPE_AUTO_PUSH_ENABLED else 1.0)
             _wake_event.clear()
     finally:

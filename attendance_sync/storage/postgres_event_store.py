@@ -396,16 +396,20 @@ class PostgresEventStore:
         ).fetchone()
         return int(row["count"]) if row else 0
 
-    def live_attendance_source_events(self, scan_limit: int = 10000) -> list[dict[str, Any]]:
-        rows = self._conn().execute(
-            """
+    def live_attendance_source_events(self, date: str | None = None, scan_limit: int | None = 10000) -> list[dict[str, Any]]:
+        query = """
             SELECT id, source_node, payload
             FROM inbound_events
-            ORDER BY id DESC
-            LIMIT %s
-            """,
-            (scan_limit,),
-        ).fetchall()
+        """
+        params: list[Any] = []
+        if date:
+            query += " WHERE substr(payload->>'time', 1, 10) = %s"
+            params.append(date)
+        query += " ORDER BY id DESC"
+        if scan_limit is not None:
+            query += " LIMIT %s"
+            params.append(scan_limit)
+        rows = self._conn().execute(query, tuple(params)).fetchall()
         out: list[dict[str, Any]] = []
         for row in rows:
             payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
@@ -587,17 +591,26 @@ class PostgresEventStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def attendance_overview(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def attendance_overview(self, limit: int | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict[str, Any]]:
         query = """
             SELECT source_node, payload, status, last_result
             FROM inbound_events
-            ORDER BY id DESC
         """
-        params: tuple[Any, ...] = ()
+        params: list[Any] = []
+        predicates: list[str] = []
+        if date_from:
+            predicates.append("substr(payload->>'time', 1, 10) >= %s")
+            params.append(date_from)
+        if date_to:
+            predicates.append("substr(payload->>'time', 1, 10) <= %s")
+            params.append(date_to)
+        if predicates:
+            query += " WHERE " + " AND ".join(predicates)
+        query += " ORDER BY id DESC"
         if limit is not None:
             query += " LIMIT %s"
-            params = (limit,)
-        rows = self._conn().execute(query, params).fetchall()
+            params.append(limit)
+        rows = self._conn().execute(query, tuple(params)).fetchall()
         grouped: dict[tuple[str, str], dict[str, Any]] = {}
         for row in rows:
             payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
