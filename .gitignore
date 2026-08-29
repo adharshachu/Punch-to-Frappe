@@ -120,7 +120,9 @@ celerybeat.pid
 .env
 .env.bak
 .env.server
+.env.*.secrets
 .env.compose
+.htpasswd
 .venv
 env/
 venv/

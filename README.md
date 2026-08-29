@@ -232,44 +232,52 @@ For a step-by-step setup checklist, see `DISTRIBUTED_SYNC_GUIDE.md`.
 
 For an Ubuntu server, use the included Docker files:
 
+Install `apache2-utils` first if the host does not provide `htpasswd`.
+
 ```bash
+cp examples/env.compose.example .env
 cp examples/env.server.docker.example .env.server
+cp examples/env.punch.secrets.example .env.punch.secrets
 cp "employee_map copy.json" employee_map.json
 python3 -m json.tool employee_map.json > /tmp/employee_map_checked.json
-export POSTGRES_PASSWORD='change_this_postgres_password'
+chmod 600 .env .env.punch.secrets
+htpasswd -B -c .htpasswd admin
+chmod 600 .htpasswd
 # The dashboard's Configuration tab writes back into .env.server, so make the
 # file writable by uid 10001 (the container's appuser) before starting.
 # The Employee Map tab also writes back to employee_map.json:
-chown 10001:10001 .env.server   # or: chmod 666 .env.server
+chown 10001:10001 .env.server
 chown 10001:10001 employee_map.json
 docker compose up -d
 ```
 
-Edit `.env.server` and change `NGINX_BASIC_AUTH_PASSWORD` before exposing the server.
-Once it's up, open the dashboard at `http://<server>:8090/` and log in with the
-Nginx username/password from `.env.server`. You can fill in Frappe URL/key/secret and
-add edge node keys directly from the Configuration tab, then run
-`docker compose restart punch-sync-server` to apply.
+Replace every placeholder in `.env` and `.env.punch.secrets` before startup. Keep
+non-secret editable settings in `.env.server`; do not enter secrets in the dashboard
+Configuration tab. The services refuse to start with missing or common placeholder
+credentials. Remote access is HTTPS-only at `https://attendance.codeace.org`; port
+8090 binds to `127.0.0.1` for emergency host-local access.
 
 Use the `cp "employee_map copy.json" employee_map.json` line only if `employee_map copy.json` is the correct final mapping. The central Docker server reads `employee_map.json` and mounts it into the container read-write so the dashboard can save mapping edits.
 
-The Docker server uses PostgreSQL by default. Set the same password in `POSTGRES_PASSWORD` and in `.env.server` `POSTGRES_DSN`.
+The Docker server uses PostgreSQL by default. Set the same password in `.env`
+`POSTGRES_PASSWORD` and `.env.punch.secrets` `POSTGRES_DSN`.
 
 The Docker Hub image is:
 
 ```text
-codeaceitsolutionsllp/punch-to-frappe
+codeaceitsolutionsllp/punch-to-frappe:<release-tag-or-digest>
 ```
 
-After GitHub Actions pushes the image, an Ubuntu server can update with:
+After GitHub Actions pushes an immutable image, set `PUNCH_SYNC_IMAGE` to its
+release tag or digest in `.env`, then update with:
 
 ```bash
 docker compose pull
 docker compose up -d
 ```
 
-That is the normal production update path. The main `docker-compose.yml` uses
-the published Docker Hub image. To build from the local checkout instead, run:
+That is the normal production update path. The compose file deliberately has no
+`:latest` fallback. To build from the local checkout instead, run:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
@@ -321,15 +329,15 @@ What it does:
 - Uses the same employee mapping, duplicate checks, and retry queue as the existing sync service.
 - Deduplicates incoming raw uploads by edge node, device IP, and device serial number so multiple devices behind one PC do not hide each other's punches.
 
-Health check:
+Health check from the Docker host:
 
 ```powershell
-Invoke-RestMethod http://central-server-ip:8090/health
+Invoke-RestMethod http://127.0.0.1:8090/health
 ```
 
 ### Web Dashboard
 
-Open `http://central-server-ip:8090/` in a browser. The dashboard shows:
+Open `https://attendance.codeace.org/` in a browser. The dashboard shows:
 
 - Pending / pushed / retry counters
 - Alert count and **Alerts** tab for punches that were not pushed, missing employee mappings, retry items, bad timestamps, and other issues needing resolution
@@ -342,29 +350,18 @@ Open `http://central-server-ip:8090/` in a browser. The dashboard shows:
 - Every pushed `Employee Checkin` sets `skip_auto_attendance` to `0`.
 - The last push run, including trigger, result breakdown, and retry count
 - An **Employee Map** tab for adding, editing, searching, and removing device employee number to Frappe employee ID mappings. Restart the server after saving so the processor reloads the map.
-- A **Configuration** tab where you can edit `HRMS_URL`, `HRMS_API_KEY`, `HRMS_API_SECRET`, `SERVER_NODE_KEYS` (add/remove edge nodes), poll/dedup intervals, log level and storage settings. Edits are written back to `.env` (or the mounted `.env.server` in Docker); restart the server to apply.
+- A **Configuration** tab for non-secret runtime settings such as `HRMS_URL`, poll/dedup intervals, log level, schedules, and storage selection. Credentials and node keys are read-only configured flags and must be rotated through the host secret files.
 
-In Docker, Nginx protects the dashboard and `/api/*` with basic auth from
-`NGINX_BASIC_AUTH_USER` and `NGINX_BASIC_AUTH_PASSWORD` in `.env.server`. The
-`/events` endpoint stays reachable without basic auth because edge PCs already
-sign uploads with HMAC.
+In Docker, Nginx protects the host-local Punch Sync administration endpoint with
+the bcrypt credentials in the host-managed `.htpasswd` file. The Python API is
+only exposed inside the Compose network, and signed edge uploads continue to use
+their existing HMAC authentication.
 
 Frontend API documentation is available in [`FRONTEND_API_README.md`](FRONTEND_API_README.md). The running server also serves Swagger UI at `/api/docs` and the raw OpenAPI spec at `/api/openapi.json`.
 
-To let the dashboard restart `punch-sync-server` after saving Employee Map in Docker:
-
-```bash
-export DOCKER_GID=$(getent group docker | cut -d: -f3)
-docker compose up -d --build
-```
-
-Set this in `.env.server`:
-
-```env
-EMPLOYEE_MAP_RESTART_COMMAND=docker restart punch-sync-server
-```
-
-This uses the Docker socket mounted into the server container, so only enable it on a trusted server.
+The application container cannot access the Docker socket. After saving Employee
+Map or non-secret configuration, an administrator must explicitly run
+`docker compose restart punch-sync-server` on the host.
 
 ### PC A / PC B Edge Setup
 
@@ -377,7 +374,7 @@ DEVICES=10.10.10.166,10.10.10.128
 DEVICE_USER=admin
 DEVICE_PASS=your_device_password
 
-SYNC_SERVER_URL=http://central-server-ip:8090
+SYNC_SERVER_URL=https://attendance.codeace.org
 EDGE_NODE_ID=pc-a
 EDGE_NODE_SECRET=long_random_secret_for_a
 POLL_INTERVAL=600
@@ -391,7 +388,7 @@ DEVICES=10.10.20.50,10.10.20.51
 DEVICE_USER=admin
 DEVICE_PASS=your_device_password
 
-SYNC_SERVER_URL=http://central-server-ip:8090
+SYNC_SERVER_URL=https://attendance.codeace.org
 EDGE_NODE_ID=pc-b
 EDGE_NODE_SECRET=long_random_secret_for_b
 POLL_INTERVAL=600

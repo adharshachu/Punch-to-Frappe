@@ -167,6 +167,7 @@ STORAGE_BACKEND: str = os.getenv("STORAGE_BACKEND", "sqlite").lower()
 STORE_PATH: Path = _root_relative_path(os.getenv("STORE_PATH", "data/events.db"))
 STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 POSTGRES_DSN: str = os.getenv("POSTGRES_DSN", "")
+POSTGRES_MAX_CONNECTIONS: int = max(1, int(os.getenv("POSTGRES_MAX_CONNECTIONS", "4")))
 
 # ── Retry queue ───────────────────────────────────────────────────────────────
 RETRY_MAX_ATTEMPTS: int = int(os.getenv("RETRY_MAX_ATTEMPTS", "5"))
@@ -176,6 +177,36 @@ RETRY_BACKOFF_BASE: float = float(os.getenv("RETRY_BACKOFF_BASE", "2.0"))  # sec
 # Central server bind settings.
 SERVER_HOST: str = os.getenv("SERVER_HOST", "0.0.0.0")
 SERVER_PORT: int = int(os.getenv("SERVER_PORT", "8080"))
+SERVER_MAX_CONCURRENT_REQUESTS: int = max(
+    1, int(os.getenv("SERVER_MAX_CONCURRENT_REQUESTS", "4"))
+)
+SERVER_MAX_HEAVY_REQUESTS: int = max(
+    1, min(
+        SERVER_MAX_CONCURRENT_REQUESTS,
+        int(os.getenv("SERVER_MAX_HEAVY_REQUESTS", "2")),
+    )
+)
+SERVER_MAX_REQUEST_BODY_BYTES: int = max(
+    1024, int(os.getenv("SERVER_MAX_REQUEST_BODY_BYTES", str(2 * 1024 * 1024)))
+)
+SERVER_MAX_EVENT_BATCH_SIZE: int = max(
+    1, int(os.getenv("SERVER_MAX_EVENT_BATCH_SIZE", "500"))
+)
+PENDING_PROCESS_BATCH_SIZE: int = max(
+    1, int(os.getenv("PENDING_PROCESS_BATCH_SIZE", "250"))
+)
+EMPLOYEE_CACHE_TTL_SECONDS: int = max(
+    1, int(os.getenv("EMPLOYEE_CACHE_TTL_SECONDS", "300"))
+)
+EMPLOYEE_CACHE_MAX_ENTRIES: int = max(
+    1, int(os.getenv("EMPLOYEE_CACHE_MAX_ENTRIES", "1000"))
+)
+NODE_TRACKER_TTL_SECONDS: int = max(
+    60, int(os.getenv("NODE_TRACKER_TTL_SECONDS", "86400"))
+)
+NODE_TRACKER_MAX_ENTRIES: int = max(
+    1, int(os.getenv("NODE_TRACKER_MAX_ENTRIES", "500"))
+)
 
 # Comma-separated node_id:shared_secret values accepted by the central server.
 # Example: SERVER_NODE_KEYS=pc-a:longSecretA,pc-b:longSecretB

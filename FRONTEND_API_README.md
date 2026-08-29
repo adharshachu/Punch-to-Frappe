@@ -2,20 +2,17 @@
 
 This document lists the HTTP endpoints used by the server dashboard. Give this to the frontend developer when building a separate UI.
 
-## Base URL And Auth
+## Base URL And Access
 
 In Docker, the public dashboard normally runs through Nginx:
 
 ```text
-http://<server-ip>:8090
+http://127.0.0.1:8090
 ```
 
-Nginx protects `/api/*` with Basic Auth using:
-
-```env
-NGINX_BASIC_AUTH_USER=...
-NGINX_BASIC_AUTH_PASSWORD=...
-```
+Nginx protects the host-local administration endpoint with its `.htpasswd`
+configuration. The HRMS server-side proxy reaches the Python service directly
+inside the Compose network and does not require additional Punch credentials.
 
 For server-local testing, the Python app also listens internally on:
 
@@ -34,13 +31,13 @@ All API responses are JSON. Error responses usually look like:
 The server also serves interactive Swagger docs:
 
 ```text
-http://<server-ip>:8090/api/docs
+http://127.0.0.1:8090/api/docs
 ```
 
 Raw OpenAPI JSON:
 
 ```text
-http://<server-ip>:8090/api/openapi.json
+http://127.0.0.1:8090/api/openapi.json
 ```
 
 Direct Python-server URLs, useful from inside the server:

@@ -13,20 +13,28 @@ from processors.punch_selection import select_daily_first_last_events
 class PostgresEventStore:
     """Thread-local PostgreSQL store implementing the EventStore interface."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, max_connections: int = 4) -> None:
         if not dsn:
             raise EnvironmentError("POSTGRES_DSN is required when STORAGE_BACKEND=postgres.")
         self._dsn = dsn
         self._local = threading.local()
+        self._connection_slots = threading.BoundedSemaphore(max(1, max_connections))
         self._init_db()
+        self.close()
 
     def _conn(self) -> psycopg.Connection:
         if not hasattr(self._local, "conn"):
-            self._local.conn = psycopg.connect(
-                self._dsn,
-                row_factory=dict_row,
-                autocommit=True,
-            )
+            if not self._connection_slots.acquire(timeout=10):
+                raise TimeoutError("PostgreSQL connection pool is at capacity")
+            try:
+                self._local.conn = psycopg.connect(
+                    self._dsn,
+                    row_factory=dict_row,
+                    autocommit=True,
+                )
+            except Exception:
+                self._connection_slots.release()
+                raise
         return self._local.conn
 
     def close(self) -> None:
@@ -34,6 +42,7 @@ class PostgresEventStore:
         if conn is not None:
             conn.close()
             del self._local.conn
+            self._connection_slots.release()
 
     def _init_db(self) -> None:
         conn = self._conn()
@@ -84,10 +93,27 @@ class PostgresEventStore:
                     received_at     TEXT    NOT NULL,
                     processed_at    TEXT,
                     last_result     TEXT,
+                    event_time      TEXT,
+                    event_date      DATE,
+                    employee_no     TEXT,
+                    device_ip       TEXT,
+                    serial_no       TEXT,
+                    normalized_at   TIMESTAMPTZ,
                     UNIQUE(source_node, source_event_id)
                 )
                 """
             )
+            for column, column_type in (
+                ("event_time", "TEXT"),
+                ("event_date", "DATE"),
+                ("employee_no", "TEXT"),
+                ("device_ip", "TEXT"),
+                ("serial_no", "TEXT"),
+                ("normalized_at", "TIMESTAMPTZ"),
+            ):
+                conn.execute(
+                    f"ALTER TABLE inbound_events ADD COLUMN IF NOT EXISTS {column} {column_type}"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS frappe_push_log (
@@ -116,10 +142,66 @@ class PostgresEventStore:
             )
             conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_inbound_events_attendance
+                ON inbound_events (event_date DESC, employee_no, event_time, serial_no, id)
+                WHERE event_date IS NOT NULL AND employee_no IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_inbound_events_live
+                ON inbound_events (event_date, id DESC)
+                WHERE event_date IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_retry_queue_due
                 ON retry_queue (next_retry, attempts)
                 """
             )
+
+        # Backfill old installations in short, restart-safe transactions. Each
+        # transaction holds at most 1000 rows and no payloads in Python memory.
+        while True:
+            with conn.transaction():
+                row = conn.execute(
+                """
+                WITH batch AS (
+                    SELECT id
+                    FROM inbound_events
+                    WHERE normalized_at IS NULL
+                    ORDER BY id
+                    LIMIT 1000
+                    FOR UPDATE SKIP LOCKED
+                ), updated AS (
+                    UPDATE inbound_events AS target
+                    SET event_time = NULLIF(target.payload->>'time', ''),
+                        event_date = CASE
+                            WHEN pg_input_is_valid(substring(target.payload->>'time', 1, 10), 'date')
+                            THEN substring(target.payload->>'time', 1, 10)::date
+                            ELSE NULL
+                        END,
+                        employee_no = NULLIF(COALESCE(
+                            target.payload->>'employeeNoString',
+                            target.payload->>'employeeNo'
+                        ), ''),
+                        device_ip = NULLIF(COALESCE(
+                            target.payload->>'deviceIP',
+                            target.payload->>'deviceIp'
+                        ), ''),
+                        serial_no = NULLIF(target.payload->>'serialNo', ''),
+                        normalized_at = NOW()
+                    FROM batch
+                    WHERE target.id = batch.id
+                    RETURNING 1
+                )
+                SELECT COUNT(*)::integer AS count FROM updated
+                """
+                ).fetchone()
+            if not row or int(row["count"] or 0) < 1000:
+                break
+        with conn.transaction():
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_frappe_push_log_attempted
@@ -296,11 +378,26 @@ class PostgresEventStore:
         with self._conn().transaction():
             for event in events:
                 source_event_id = self._source_event_id(event)
+                event_time = str(event.get("time") or "").strip() or None
+                event_date = None
+                if event_time and len(event_time) >= 10:
+                    try:
+                        event_date = datetime.fromisoformat(event_time[:10]).date().isoformat()
+                    except ValueError:
+                        pass
+                employee_no = str(
+                    event.get("employeeNoString") or event.get("employeeNo") or ""
+                ).strip() or None
+                device_ip = str(
+                    event.get("deviceIP") or event.get("deviceIp") or ""
+                ).strip() or None
+                serial_no = str(event.get("serialNo") or "").strip() or None
                 row = self._conn().execute(
                     """
                     INSERT INTO inbound_events
-                        (source_node, source_event_id, payload, received_at)
-                    VALUES (%s, %s, %s::jsonb, %s)
+                        (source_node, source_event_id, payload, received_at,
+                         event_time, event_date, employee_no, device_ip, serial_no, normalized_at)
+                    VALUES (%s, %s, %s::jsonb, %s, %s, %s::date, %s, %s, %s, NOW())
                     ON CONFLICT (source_node, source_event_id) DO NOTHING
                     RETURNING id
                     """,
@@ -309,6 +406,11 @@ class PostgresEventStore:
                         source_event_id,
                         json.dumps(event, separators=(",", ":"), sort_keys=True),
                         now,
+                        event_time,
+                        event_date,
+                        employee_no,
+                        device_ip,
+                        serial_no,
                     ),
                 ).fetchone()
                 if row:
@@ -318,18 +420,23 @@ class PostgresEventStore:
 
         return inserted, skipped
 
-    def get_pending_inbound_events(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def get_pending_inbound_events(
+        self, limit: int | None = None, after_id: int | None = None
+    ) -> list[dict[str, Any]]:
         query = """
             SELECT id, source_node, payload
             FROM inbound_events
             WHERE status = 'pending'
-            ORDER BY received_at, id
         """
-        params: tuple[Any, ...] = ()
+        params: list[Any] = []
+        if after_id is not None:
+            query += " AND id > %s"
+            params.append(after_id)
+        query += " ORDER BY id"
         if limit is not None:
             query += " LIMIT %s"
-            params = (limit,)
-        rows = self._conn().execute(query, params).fetchall()
+            params.append(limit)
+        rows = self._conn().execute(query, tuple(params)).fetchall()
         return [
             {
                 "id": row["id"],
@@ -398,12 +505,12 @@ class PostgresEventStore:
 
     def live_attendance_source_events(self, date: str | None = None, scan_limit: int | None = 10000) -> list[dict[str, Any]]:
         query = """
-            SELECT id, source_node, payload
+            SELECT id, source_node, payload, event_time, employee_no, device_ip, serial_no
             FROM inbound_events
         """
         params: list[Any] = []
         if date:
-            query += " WHERE substr(payload->>'time', 1, 10) = %s"
+            query += " WHERE event_date = %s::date"
             params.append(date)
         query += " ORDER BY id DESC"
         if scan_limit is not None:
@@ -413,21 +520,17 @@ class PostgresEventStore:
         out: list[dict[str, Any]] = []
         for row in rows:
             payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            event_time = str(payload.get("time") or "").strip()
-            employee = str(
-                payload.get("employeeNoString") or payload.get("employeeNo") or ""
-            ).strip()
+            event_time = str(row["event_time"] or payload.get("time") or "").strip()
+            employee = str(row["employee_no"] or "").strip()
             if not employee or not event_time:
                 continue
-            device_ip = str(
-                payload.get("deviceIP") or payload.get("deviceIp") or ""
-            ).strip()
+            device_ip = str(row["device_ip"] or "").strip()
             out.append(
                 {
                     "id": row["id"],
                     "employee": employee,
                     "event_time": event_time,
-                    "serial_no": payload.get("serialNo"),
+                    "serial_no": row["serial_no"],
                     "name": payload.get("name"),
                     "device_ip": device_ip,
                     "source_node": row["source_node"],
@@ -475,56 +578,64 @@ class PostgresEventStore:
         date_to: str = "",
         status: str = "",
     ) -> dict[str, Any]:
+        predicates: list[str] = []
+        params: list[Any] = []
+        if date_from:
+            predicates.append("event_date >= %s::date")
+            params.append(date_from)
+        if date_to:
+            predicates.append("event_date <= %s::date")
+            params.append(date_to)
+        if status:
+            predicates.append("status = %s")
+            params.append(status)
+        if search:
+            predicates.append(
+                "concat_ws(' ', id::text, source_node, status, received_at, "
+                "processed_at, last_result, employee_no, payload->>'name', device_ip, "
+                "event_time, serial_no, payload->>'eventType', payload->>'minor') ILIKE %s"
+            )
+            params.append(f"%{search}%")
+        where = " WHERE " + " AND ".join(predicates) if predicates else ""
+        offset = (page - 1) * page_size
+        params.extend([page_size, offset])
         rows = self._conn().execute(
-            """
-            SELECT id, source_node, payload, status, received_at, processed_at, last_result
+            f"""
+            SELECT id, source_node, payload, status, received_at, processed_at,
+                   last_result, employee_no, device_ip, event_time, serial_no,
+                   COUNT(*) OVER() AS total_count
             FROM inbound_events
+            {where}
             ORDER BY id DESC
-            """
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
         ).fetchall()
-        search_text = search.lower()
-        filtered: list[dict[str, Any]] = []
+        total = int(rows[0]["total_count"]) if rows else 0
+        records: list[dict[str, Any]] = []
         for row in rows:
             payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            event_time = str(payload.get("time") or "").strip()
-            event_date = event_time.split("T", 1)[0].split(" ", 1)[0] if event_time else ""
-            if date_from and event_date < date_from:
-                continue
-            if date_to and event_date > date_to:
-                continue
-            if status and row["status"] != status:
-                continue
-
-            record = {
+            records.append({
                 "id": row["id"],
                 "source_node": row["source_node"],
                 "status": row["status"],
                 "received_at": row["received_at"],
                 "processed_at": row["processed_at"],
                 "last_result": row["last_result"],
-                "employee": payload.get("employeeNoString") or payload.get("employeeNo"),
+                "employee": row["employee_no"],
                 "name": payload.get("name"),
-                "device_ip": payload.get("deviceIP"),
-                "event_time": event_time,
-                "serial_no": payload.get("serialNo"),
+                "device_ip": row["device_ip"],
+                "event_time": row["event_time"] or "",
+                "serial_no": row["serial_no"],
                 "event_type": payload.get("eventType"),
                 "minor": payload.get("minor"),
-            }
-            if search_text:
-                haystack = " ".join(str(value or "") for value in record.values()).lower()
-                if search_text not in haystack:
-                    continue
-            filtered.append(record)
-
-        total = len(filtered)
-        start = (page - 1) * page_size
-        end = start + page_size
+            })
         return {
-            "records": filtered[start:end],
+            "records": records,
             "page": page,
             "page_size": page_size,
             "total": total,
-            "has_next": end < total,
+            "has_next": offset + page_size < total,
             "has_prev": page > 1,
         }
 
@@ -592,81 +703,221 @@ class PostgresEventStore:
         return [dict(row) for row in rows]
 
     def attendance_overview(self, limit: int | None = None, date_from: str | None = None, date_to: str | None = None) -> list[dict[str, Any]]:
-        query = """
-            SELECT source_node, payload, status, last_result
-            FROM inbound_events
-        """
+        page_size = limit if limit is not None else 2_147_483_647
+        return self.attendance_overview_page(
+            page=1,
+            page_size=page_size,
+            date_from=date_from or "",
+            date_to=date_to or "",
+        )["overview"]
+
+    def attendance_overview_page(
+        self,
+        page: int = 1,
+        page_size: int = 100,
+        search: str = "",
+        date_from: str = "",
+        date_to: str = "",
+        status: str = "",
+        late_after: str = "09:30",
+        eligible_employee_ids: list[str] | None = None,
+        search_employee_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        predicates = ["event_date IS NOT NULL", "employee_no IS NOT NULL", "event_time IS NOT NULL"]
         params: list[Any] = []
-        predicates: list[str] = []
         if date_from:
-            predicates.append("substr(payload->>'time', 1, 10) >= %s")
+            predicates.append("event_date >= %s::date")
             params.append(date_from)
         if date_to:
-            predicates.append("substr(payload->>'time', 1, 10) <= %s")
+            predicates.append("event_date <= %s::date")
             params.append(date_to)
-        if predicates:
-            query += " WHERE " + " AND ".join(predicates)
-        query += " ORDER BY id DESC"
-        if limit is not None:
-            query += " LIMIT %s"
-            params.append(limit)
-        rows = self._conn().execute(query, tuple(params)).fetchall()
-        grouped: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in rows:
-            payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"])
-            employee = str(
-                payload.get("employeeNoString") or payload.get("employeeNo") or ""
-            ).strip()
-            event_time = str(payload.get("time") or "").strip()
-            if not employee or not event_time:
-                continue
-
-            event_date = event_time.split("T", 1)[0].split(" ", 1)[0]
-            key = (employee, event_date)
-            item = grouped.setdefault(
-                key,
-                {
-                    "employee": employee,
-                    "date": event_date,
-                    "source_nodes": set(),
-                    "devices": set(),
-                    "punch_count": 0,
-                    "first_time": None,
-                    "first_result": None,
-                    "last_time": None,
-                    "last_result": None,
-                    "_events": [],
-                },
+        if eligible_employee_ids is not None:
+            predicates.append("employee_no = ANY(%s::text[])")
+            params.append(eligible_employee_ids)
+        raw_where = " AND ".join(predicates)
+        filtered_predicates: list[str] = []
+        if search:
+            filtered_predicates.append(
+                "(concat_ws(' ', employee, date::text, first_time, last_time, "
+                "array_to_string(source_nodes, ' '), array_to_string(devices, ' ')) ILIKE %s "
+                "OR employee = ANY(%s::text[]))"
             )
-            item["source_nodes"].add(row["source_node"])
-            device_ip = payload.get("deviceIP")
-            if device_ip:
-                item["devices"].add(str(device_ip))
-            item["punch_count"] += 1
-            item["_events"].append(
-                {
-                    "time": event_time,
-                    "result": row["last_result"] or row["status"],
-                    "serialNo": payload.get("serialNo"),
-                }
+            params.append(f"%{search}%")
+            params.append(search_employee_ids or [])
+        normalized_status = status.strip().lower()
+        if normalized_status == "late":
+            filtered_predicates.append("substring(first_time, 12, 5) > %s")
+            params.append(late_after)
+        elif normalized_status in {"present", "on_time"}:
+            filtered_predicates.append("substring(first_time, 12, 5) <= %s")
+            params.append(late_after)
+        elif normalized_status in {"absent", "missing_first_punch"}:
+            filtered_predicates.append("first_time IS NULL")
+        filtered_where = (
+            "WHERE " + " AND ".join(filtered_predicates)
+            if filtered_predicates else ""
+        )
+        offset = (page - 1) * page_size
+        params.extend([page_size, offset])
+        rows = self._conn().execute(
+            f"""
+            WITH grouped AS (
+                SELECT employee_no AS employee, event_date AS date,
+                       array_agg(DISTINCT source_node ORDER BY source_node) AS source_nodes,
+                       array_remove(array_agg(DISTINCT device_ip ORDER BY device_ip), NULL) AS devices,
+                       COUNT(*)::integer AS punch_count,
+                       (array_agg(event_time ORDER BY
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END,
+                           event_time, COALESCE(serial_no, ''), id))[1] AS first_time,
+                       (array_agg(COALESCE(last_result, status) ORDER BY
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END,
+                           event_time, COALESCE(serial_no, ''), id))[1] AS first_result,
+                       CASE WHEN COUNT(*) > 1 THEN
+                           (array_agg(event_time ORDER BY
+                               CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                               CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END DESC,
+                               event_time DESC, COALESCE(serial_no, '') DESC, id DESC))[1]
+                       END AS last_time,
+                       CASE WHEN COUNT(*) > 1 THEN
+                           (array_agg(COALESCE(last_result, status) ORDER BY
+                               CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                               CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END DESC,
+                               event_time DESC, COALESCE(serial_no, '') DESC, id DESC))[1]
+                       END AS last_result
+                FROM inbound_events
+                WHERE {raw_where}
+                GROUP BY employee_no, event_date
+            ), filtered AS (
+                SELECT * FROM grouped {filtered_where}
             )
-
+            SELECT *, COUNT(*) OVER() AS total_count
+            FROM filtered
+            ORDER BY date DESC, employee DESC
+            LIMIT %s OFFSET %s
+            """,
+            tuple(params),
+        ).fetchall()
+        total = int(rows[0]["total_count"]) if rows else 0
         overview = []
-        for item in grouped.values():
-            boundaries = select_daily_first_last_events(item.pop("_events"))
-            first = boundaries["first"]
-            last = boundaries["last"]
-            if first:
-                item["first_time"] = first["time"]
-                item["first_result"] = first["result"]
-            if last:
-                item["last_time"] = last["time"]
-                item["last_result"] = last["result"]
-            item["source_nodes"] = sorted(item["source_nodes"])
-            item["devices"] = sorted(item["devices"])
+        for row in rows:
+            item = dict(row)
+            item.pop("total_count", None)
+            if hasattr(item["date"], "isoformat"):
+                item["date"] = item["date"].isoformat()
             overview.append(item)
-        overview.sort(key=lambda item: (item["date"], item["employee"]), reverse=True)
-        return overview
+        return {
+            "overview": overview,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "has_next": offset + page_size < total,
+            "has_prev": page > 1,
+        }
+
+    def attendance_overview_summary(
+        self,
+        *,
+        date_from: str = "",
+        date_to: str = "",
+        late_after: str = "09:30",
+        mapped_employees: list[str] | None = None,
+    ) -> dict[str, int]:
+        predicates = ["event_date IS NOT NULL", "employee_no IS NOT NULL", "event_time IS NOT NULL"]
+        params: list[Any] = []
+        if date_from:
+            predicates.append("event_date >= %s::date")
+            params.append(date_from)
+        if date_to:
+            predicates.append("event_date <= %s::date")
+            params.append(date_to)
+        query_params = params + [late_after, late_after, mapped_employees or []]
+        row = self._conn().execute(
+            f"""
+            WITH days AS (
+                SELECT employee_no AS employee,
+                       (array_agg(event_time ORDER BY
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END,
+                           event_time, COALESCE(serial_no, ''), id))[1] AS first_time
+                FROM inbound_events
+                WHERE {' AND '.join(predicates)}
+                GROUP BY employee_no, event_date
+            )
+            SELECT COUNT(*)::integer AS total,
+                   COUNT(*) FILTER (
+                       WHERE substring(first_time, 12, 5) > %s
+                   )::integer AS late,
+                   COUNT(*) FILTER (
+                       WHERE substring(first_time, 12, 5) <= %s
+                   )::integer AS on_time,
+                   COUNT(*) FILTER (
+                       WHERE NOT (employee = ANY(%s::text[]))
+                   )::integer AS missing_map
+            FROM days
+            """,
+            tuple(query_params),
+        ).fetchone()
+        return {
+            "total": int(row["total"] or 0),
+            "late": int(row["late"] or 0),
+            "on_time": int(row["on_time"] or 0),
+            "missing_map": int(row["missing_map"] or 0),
+        }
+
+    def dashboard_summary_aggregates(
+        self, *, date_from: str, date_to: str, late_after: str
+    ) -> dict[str, Any]:
+        """Return compact DB-native daily and employee aggregates."""
+        base = """
+            WITH days AS (
+                SELECT employee_no AS employee, event_date AS date,
+                       (array_agg(event_time ORDER BY
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN 0 ELSE 1 END,
+                           CASE WHEN pg_input_is_valid(event_time, 'timestamp with time zone') THEN event_time::timestamptz END,
+                           event_time, COALESCE(serial_no, ''), id))[1] AS first_time
+                FROM inbound_events
+                WHERE event_date BETWEEN %s::date AND %s::date
+                  AND employee_no IS NOT NULL AND event_time IS NOT NULL
+                GROUP BY employee_no, event_date
+            )
+        """
+        trend_rows = self._conn().execute(
+            base + """
+            SELECT date, COUNT(*)::integer AS total,
+                   COUNT(*) FILTER (WHERE substring(first_time, 12, 5) > %s)::integer AS late,
+                   COUNT(*) FILTER (WHERE substring(first_time, 12, 5) <= %s)::integer AS on_time
+            FROM days GROUP BY date ORDER BY date
+            """,
+            (date_from, date_to, late_after, late_after),
+        ).fetchall()
+        employee_rows = self._conn().execute(
+            base + """
+            SELECT employee, COUNT(*)::integer AS total,
+                   COUNT(*) FILTER (WHERE substring(first_time, 12, 5) > %s)::integer AS late,
+                   COUNT(*) FILTER (WHERE substring(first_time, 12, 5) <= %s)::integer AS on_time
+            FROM days GROUP BY employee ORDER BY employee
+            """,
+            (date_from, date_to, late_after, late_after),
+        ).fetchall()
+        trend = []
+        for row in trend_rows:
+            item = dict(row)
+            if hasattr(item["date"], "isoformat"):
+                item["date"] = item["date"].isoformat()
+            trend.append(item)
+        employees = [dict(row) for row in employee_rows]
+        return {
+            "stats": {
+                "total": sum(int(row["total"]) for row in trend),
+                "late": sum(int(row["late"]) for row in trend),
+                "on_time": sum(int(row["on_time"]) for row in trend),
+                "total_employees": len(employees),
+            },
+            "trend": trend,
+            "employees": employees,
+        }
 
     def dashboard_alerts(self, limit: int = 100) -> list[dict[str, Any]]:
         alerts: list[dict[str, Any]] = []

@@ -311,19 +311,24 @@ class EventStore:
         self._conn().commit()
         return inserted, skipped
 
-    def get_pending_inbound_events(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def get_pending_inbound_events(
+        self, limit: int | None = None, after_id: int | None = None
+    ) -> list[dict[str, Any]]:
         """Return queued edge events that still need to be pushed to Frappe."""
         query = """
             SELECT id, source_node, payload
             FROM inbound_events
             WHERE status = 'pending'
-            ORDER BY received_at, id
         """
-        params: tuple[Any, ...] = ()
+        params: list[Any] = []
+        if after_id is not None:
+            query += " AND id > ?"
+            params.append(after_id)
+        query += " ORDER BY id"
         if limit is not None:
             query += " LIMIT ?"
-            params = (limit,)
-        cur = self._conn().execute(query, params)
+            params.append(limit)
+        cur = self._conn().execute(query, tuple(params))
         rows = []
         for row in cur.fetchall():
             rows.append(

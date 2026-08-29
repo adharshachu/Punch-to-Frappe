@@ -131,38 +131,28 @@ sudo usermod -aG docker $USER
 
 Log out and log back in after running that command.
 
-Create the server env file:
+Create the Compose, non-secret settings, and secret env files:
 
 ```bash
+cp examples/env.compose.example .env
 cp examples/env.server.docker.example .env.server
+cp examples/env.punch.secrets.example .env.punch.secrets
+chmod 600 .env .env.punch.secrets
+htpasswd -B -c .htpasswd admin
+chmod 600 .htpasswd
 ```
 
-Edit `.env.server` for Frappe, storage, edge node settings, and the dashboard login:
+Edit `.env.server` for non-secret runtime settings. Put Frappe credentials,
+edge node keys, and the PostgreSQL DSN only in `.env.punch.secrets`:
 
 ```bash
 nano .env.server
+nano .env.punch.secrets
 ```
 
-At minimum, change:
-
-```env
-NGINX_BASIC_AUTH_USER=admin
-NGINX_BASIC_AUTH_PASSWORD=change_this_dashboard_password
-```
-
-Set the same Postgres password in two places:
-
-```bash
-export POSTGRES_PASSWORD='change_this_postgres_password'
-```
-
-And inside `.env.server`:
-
-```env
-POSTGRES_DSN=postgresql://punch_sync:change_this_postgres_password@postgres:5432/punch_sync
-```
-
-For production, replace `change_this_postgres_password` with a strong password in both places. Docker Compose uses `POSTGRES_PASSWORD` when creating the database container, and the app uses `POSTGRES_DSN` to connect to it.
+Replace every placeholder. Set the same URL-safe PostgreSQL password in `.env`
+`POSTGRES_PASSWORD` and `.env.punch.secrets` `POSTGRES_DSN`. Docker Compose uses the
+first when creating PostgreSQL, and the application uses the second to connect.
 
 Generate PC keys:
 
@@ -170,7 +160,7 @@ Generate PC keys:
 python3 generate_sync_keys.py
 ```
 
-Put the generated `SERVER_NODE_KEYS=...` line into `.env.server`.
+Put the generated `SERVER_NODE_KEYS=...` line into `.env.punch.secrets`.
 
 Prepare the employee mapping file on the Ubuntu server.
 
@@ -287,10 +277,11 @@ The PostgreSQL tables store:
 
 Nginx is the public entrypoint:
 
-- Public URL: `http://<server>:8090/` by default.
+- Public HRMS and signed edge-ingest URL: `https://attendance.codeace.org`.
+- Punch Sync administration: host-local `http://127.0.0.1:8090/` (use an SSH tunnel for remote administration).
 - Change the public port with `DASHBOARD_PORT` in a Docker Compose `.env` file, or leave it at `8090`.
-- Dashboard and `/api/*` require the Nginx username/password from `.env.server`.
-- `/events` does not use basic auth so PC A and PC B can upload normally; those uploads are still protected by HMAC signatures.
+- The host-local Punch Sync dashboard is protected by Nginx using `.htpasswd`.
+- `/events` uploads remain protected by their existing HMAC signatures.
 - The Python app is internal to Docker on port `8080`.
 
 ### Docker Image Build In GitHub Actions
@@ -331,15 +322,16 @@ The image name is:
 codeaceitsolutionsllp/punch-to-frappe
 ```
 
-The compose file uses:
+The compose file requires `PUNCH_SYNC_IMAGE` in `.env`. Pin it to an immutable
+release tag or digest, for example:
 
 ```text
-codeaceitsolutionsllp/punch-to-frappe:latest
+codeaceitsolutionsllp/punch-to-frappe:sha-a6a7ea5
 ```
 
 The default `docker-compose.yml` is meant for deployment from Docker Hub, so
 `docker compose pull && docker compose up -d` is enough after a new image is
-published. Use `docker-compose.build.yml` only when you intentionally want to
+published and `.env` points at that release. Use `docker-compose.build.yml` only when you intentionally want to
 build from files on that server.
 
 The workflow publishes these tags:
@@ -444,7 +436,7 @@ DEVICES=10.10.10.166,10.10.10.128
 DEVICE_USER=admin
 DEVICE_PASS=your_device_password
 
-SYNC_SERVER_URL=http://central-server-ip:8090
+SYNC_SERVER_URL=https://attendance.codeace.org
 EDGE_NODE_ID=pc-a
 EDGE_NODE_SECRET=change_this_to_a_long_random_secret_for_pc_a
 
@@ -491,7 +483,7 @@ DEVICES=10.10.20.50,10.10.20.51
 DEVICE_USER=admin
 DEVICE_PASS=your_device_password
 
-SYNC_SERVER_URL=http://central-server-ip:8090
+SYNC_SERVER_URL=https://attendance.codeace.org
 EDGE_NODE_ID=pc-b
 EDGE_NODE_SECRET=change_this_to_a_long_random_secret_for_pc_b
 
@@ -522,7 +514,7 @@ Test in this order.
 From PC A or PC B, run:
 
 ```powershell
-Invoke-RestMethod http://central-server-ip:8090/health
+Invoke-RestMethod http://127.0.0.1:8090/health
 ```
 
 If this fails, check:

@@ -10,6 +10,8 @@ queue, per-node connection status, and a manual "Push now" button.
 import json
 import logging
 import errno
+import pickle
+import sqlite3
 import signal
 import subprocess
 import sys
@@ -33,7 +35,7 @@ from config.env_file import read_env, update_env
 from hrms.frappe_client import FrappeClient
 from processors.event_processor import EventProcessor
 from processors.live_attendance import build_live_attendance, live_calendar_today
-from processors.punch_selection import select_daily_punches
+from processors.punch_selection import punch_sort_key, select_daily_punches
 from storage.factory import create_event_store
 from transport.security import (
     NODE_HEADER,
@@ -54,8 +56,14 @@ _wake_event = threading.Event()
 
 # Caps how many HTTP requests are handled at once so dashboard polls and API
 # floods cannot exhaust memory on a small server.
-_MAX_CONCURRENT_REQUESTS = 24
+_MAX_CONCURRENT_REQUESTS = settings.SERVER_MAX_CONCURRENT_REQUESTS
 _request_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
+_heavy_request_slots = threading.BoundedSemaphore(settings.SERVER_MAX_HEAVY_REQUESTS)
+_HEAVY_GET_PATHS = {
+    "/api/attendance-overview",
+    "/api/hr-verification",
+    "/api/dashboard-summary",
+}
 
 # Default window for the attendance overview when no date range is requested,
 # so an unfiltered dashboard view can never load the whole event table.
@@ -102,20 +110,26 @@ _uptime_monitor: dict[str, Any] = {
 }
 
 # Keys treated as secrets in the config API: masked in GET, blank-on-PUT means keep.
-_SECRET_KEYS = {"HRMS_API_KEY", "HRMS_API_SECRET", "POSTGRES_DSN", "SLACK_WEBHOOK_URL"}
+_PROTECTED_CONFIG_KEYS = {
+    "HRMS_API_KEY",
+    "HRMS_API_SECRET",
+    "POSTGRES_DSN",
+    "SLACK_WEBHOOK_URL",
+    "SERVER_NODE_KEYS",
+    "NGINX_BASIC_AUTH_USER",
+    "NGINX_BASIC_AUTH_PASSWORD",
+    "EMPLOYEE_MAP_RESTART_COMMAND",
+}
 
 # Whitelist of plain key/value config fields editable via the dashboard.
 _EDITABLE_KEYS = (
     "HRMS_URL",
-    "HRMS_API_KEY",
-    "HRMS_API_SECRET",
     "POLL_INTERVAL",
     "DEDUP_WINDOW",
     "LOG_LEVEL",
     "SERVER_HOST",
     "SERVER_PORT",
     "STORAGE_BACKEND",
-    "POSTGRES_DSN",
     "DEFAULT_LOG_TYPE",
     "LATE_AFTER_TIME",
     "FRAPPE_AUTO_PUSH_ENABLED",
@@ -125,13 +139,13 @@ _EDITABLE_KEYS = (
     "NODE_UPTIME_THRESHOLD_HOURS",
     "NODE_UPTIME_CHECK_INTERVAL_SECONDS",
     "NODE_UPTIME_NOTIFY_ON_RECOVERY",
-    "SLACK_WEBHOOK_URL",
-    "EMPLOYEE_MAP_RESTART_COMMAND",
 )
 
 _employee_details_lock = threading.Lock()
 _employee_details_cache: dict[str, dict[str, Any]] = {}
 _employee_details_cache_expires_at = 0.0
+_dashboard_summary_lock = threading.Lock()
+_dashboard_summary_cache: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
 def _int_query(params: dict[str, list[str]], key: str, default: int, minimum: int, maximum: int) -> int:
@@ -152,7 +166,9 @@ class NodeTracker:
 
     def record(self, node_id: str, accepted: int, inserted: int, skipped: int) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        monotonic_now = time.monotonic()
         with self._lock:
+            self._prune(monotonic_now)
             entry = self._nodes.setdefault(
                 node_id,
                 {"first_seen": now, "total_accepted": 0, "total_inserted": 0, "total_skipped": 0},
@@ -164,16 +180,40 @@ class NodeTracker:
             entry["total_accepted"] += accepted
             entry["total_inserted"] += inserted
             entry["total_skipped"] += skipped
+            entry["_last_seen_monotonic"] = monotonic_now
+            self._prune(monotonic_now)
 
     def record_unauthorized(self, node_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        monotonic_now = time.monotonic()
         with self._lock:
+            self._prune(monotonic_now)
             entry = self._nodes.setdefault(node_id or "(unknown)", {"first_seen": now})
             entry["last_unauthorized_at"] = now
+            entry["_last_seen_monotonic"] = monotonic_now
+            self._prune(monotonic_now)
 
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [dict({"node_id": k}, **v) for k, v in self._nodes.items()]
+            self._prune(time.monotonic())
+            return [
+                {"node_id": key, **{k: value for k, value in entry.items() if not k.startswith("_")}}
+                for key, entry in self._nodes.items()
+            ]
+
+    def _prune(self, now: float) -> None:
+        expired = [
+            key for key, entry in self._nodes.items()
+            if now - float(entry.get("_last_seen_monotonic", now)) > settings.NODE_TRACKER_TTL_SECONDS
+        ]
+        for key in expired:
+            self._nodes.pop(key, None)
+        while len(self._nodes) > settings.NODE_TRACKER_MAX_ENTRIES:
+            oldest = min(
+                self._nodes,
+                key=lambda key: float(self._nodes[key].get("_last_seen_monotonic", 0.0)),
+            )
+            self._nodes.pop(oldest, None)
 
 
 _node_tracker = NodeTracker()
@@ -240,24 +280,20 @@ def _parse_node_keys(raw: str) -> list[dict[str, str]]:
 
 
 def _load_config_view() -> dict[str, Any]:
-    """Return current .env values with secrets masked, suitable for the UI."""
+    """Return editable non-secret values and secret configured booleans."""
     env = read_env(_ENV_PATH)
     values: dict[str, Any] = {}
     for key in _EDITABLE_KEYS:
         raw = env.get(key, "")
-        if key in _SECRET_KEYS:
-            values[key] = {"set": bool(raw), "value": ""}
-        else:
-            values[key] = {"set": bool(raw), "value": raw}
-
-    nodes = [
-        {"node_id": n["node_id"], "secret_set": bool(n["secret"])}
-        for n in _parse_node_keys(env.get("SERVER_NODE_KEYS", ""))
-    ]
+        values[key] = {"set": bool(raw), "value": raw}
     return {
         "env_path": str(_ENV_PATH),
         "values": values,
-        "nodes": nodes,
+        "configured": {
+            key: bool(env.get(key, "") or getattr(settings, key, ""))
+            for key in sorted(_PROTECTED_CONFIG_KEYS)
+            if key != "EMPLOYEE_MAP_RESTART_COMMAND"
+        },
     }
 
 
@@ -270,48 +306,24 @@ def _save_config(body: dict[str, Any]) -> list[str]:
         "values": {KEY: "new value", ...},
         "nodes":  [{node_id, secret}, ...]      # full replacement of SERVER_NODE_KEYS
       }
-    For secret keys, an empty/missing value means "keep existing". For node
-    secrets, an empty secret on an existing node means "keep its existing
-    secret"; a new node_id with empty secret is rejected.
+    Secret values and node credentials are deliberately not writable here.
     """
     incoming_values = body.get("values") or {}
     if not isinstance(incoming_values, dict):
         raise ValueError("values must be an object")
 
-    current = read_env(_ENV_PATH)
     updates: dict[str, str] = {}
 
     for key, new_value in incoming_values.items():
+        if key in _PROTECTED_CONFIG_KEYS:
+            raise ValueError(f"{key} cannot be changed through the dashboard")
         if key not in _EDITABLE_KEYS:
             continue
         new_value = "" if new_value is None else str(new_value)
-        if key in _SECRET_KEYS and new_value == "":
-            continue
         updates[key] = new_value
 
     if "nodes" in body:
-        nodes_in = body.get("nodes") or []
-        if not isinstance(nodes_in, list):
-            raise ValueError("nodes must be a list")
-        existing_secrets = {n["node_id"]: n["secret"] for n in _parse_node_keys(current.get("SERVER_NODE_KEYS", ""))}
-        merged: list[str] = []
-        for entry in nodes_in:
-            if not isinstance(entry, dict):
-                raise ValueError("each node must be an object")
-            node_id = str(entry.get("node_id", "")).strip()
-            secret = str(entry.get("secret", "")).strip()
-            if not node_id:
-                continue
-            if "," in node_id or ":" in node_id:
-                raise ValueError(f"node_id '{node_id}' may not contain ',' or ':'")
-            if not secret:
-                secret = existing_secrets.get(node_id, "")
-            if not secret:
-                raise ValueError(f"secret required for new node '{node_id}'")
-            if "," in secret:
-                raise ValueError(f"secret for '{node_id}' may not contain ','")
-            merged.append(f"{node_id}:{secret}")
-        updates["SERVER_NODE_KEYS"] = ",".join(merged)
+        raise ValueError("SERVER_NODE_KEYS cannot be changed through the dashboard")
 
     update_env(_ENV_PATH, updates)
     return list(updates.keys())
@@ -676,7 +688,9 @@ def _load_frappe_employee_details(
                 _employee_details_cache.update(fetched)
                 for employee_id in missing:
                     _employee_details_cache.setdefault(employee_id, {})
-                _employee_details_cache_expires_at = now + 300
+                while len(_employee_details_cache) > settings.EMPLOYEE_CACHE_MAX_ENTRIES:
+                    _employee_details_cache.pop(next(iter(_employee_details_cache)))
+                _employee_details_cache_expires_at = now + settings.EMPLOYEE_CACHE_TTL_SECONDS
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load Frappe employee details: %s", exc)
             error = str(exc)
@@ -724,14 +738,17 @@ def _hr_verification_rows(
     date_to: str,
     late_after: str,
     refresh_frappe: bool,
+    overview_rows: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     employee_map = settings.load_employee_map()
-    overview = _filter_attendance_overview(
-        store.attendance_overview(limit=None, date_from=date_from or None, date_to=date_to or None),
-        "",
-        date_from,
-        date_to,
-    )
+    overview = overview_rows
+    if overview is None:
+        overview = _filter_attendance_overview(
+            store.attendance_overview(limit=None, date_from=date_from or None, date_to=date_to or None),
+            "",
+            date_from,
+            date_to,
+        )
     mapped_ids = [employee_map.get(str(row.get("employee") or "").strip(), "") for row in overview]
     details_by_id, frappe_error = _load_frappe_employee_details(frappe, mapped_ids, refresh=refresh_frappe)
     late_label, late_minutes = _late_threshold_minutes(late_after)
@@ -807,56 +824,205 @@ def _hr_verification_rows(
     return rows, summary
 
 
+def _dashboard_summary_payload(
+    store: Any,
+    frappe: FrappeClient,
+    date_from: str,
+    date_to: str,
+) -> dict[str, Any]:
+    cache_key = (date_from, date_to)
+    now = time.monotonic()
+    with _dashboard_summary_lock:
+        cached = _dashboard_summary_cache.get(cache_key)
+        if cached and now - cached[0] < 30:
+            return dict(cached[1])
+
+    if hasattr(store, "dashboard_summary_aggregates"):
+        aggregate = store.dashboard_summary_aggregates(
+            date_from=date_from,
+            date_to=date_to,
+            late_after=settings.LATE_AFTER_TIME,
+        )
+        employee_map = settings.load_employee_map()
+        mapped_ids = [
+            employee_map.get(str(row.get("employee") or ""), "")
+            for row in aggregate["employees"]
+        ]
+        details_by_id, _ = _load_frappe_employee_details(frappe, mapped_ids)
+        departments: dict[str, dict[str, Any]] = {}
+        missing_map = 0
+        for row in aggregate["employees"]:
+            device_id = str(row.get("employee") or "")
+            frappe_id = employee_map.get(device_id, "")
+            if not frappe_id:
+                missing_map += int(row["total"])
+            department = str(details_by_id.get(frappe_id, {}).get("department") or "Unassigned")
+            item = departments.setdefault(
+                department,
+                {"department": department, "total": 0, "late": 0, "on_time": 0, "missing_map": 0},
+            )
+            for key in ("total", "late", "on_time"):
+                item[key] += int(row[key])
+            if not frappe_id:
+                item["missing_map"] += int(row["total"])
+        stats = dict(aggregate["stats"])
+        stats["missing_map"] = missing_map
+        payload = {
+            "stats": stats,
+            "trend": aggregate["trend"],
+            "departments": sorted(departments.values(), key=lambda item: (-item["total"], item["department"])),
+            "live": _live_attendance_payload(store, frappe, feed_limit=50, refresh_frappe=False),
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+        with _dashboard_summary_lock:
+            _dashboard_summary_cache.clear()
+            _dashboard_summary_cache[cache_key] = (now, payload)
+        return dict(payload)
+
+    rows, summary = _hr_verification_rows(
+        store,
+        frappe,
+        search="",
+        date_from=date_from,
+        date_to=date_to,
+        late_after=settings.LATE_AFTER_TIME,
+        refresh_frappe=False,
+    )
+    trend_by_date: dict[str, dict[str, Any]] = {}
+    departments: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        date = str(row.get("date") or "")
+        department = str(row.get("department") or "Unassigned")
+        for bucket, key in ((trend_by_date, date), (departments, department)):
+            item = bucket.setdefault(
+                key,
+                {
+                    "date" if bucket is trend_by_date else "department": key,
+                    "total": 0,
+                    "late": 0,
+                    "on_time": 0,
+                    "missing_map": 0,
+                },
+            )
+            item["total"] += 1
+            if row["late_status"] in {"late", "on_time"}:
+                item[row["late_status"]] += 1
+            if row["mapping_status"] == "missing_map":
+                item["missing_map"] += 1
+    payload = {
+        "stats": {
+            **{key: summary[key] for key in ("total", "late", "on_time", "missing_map")},
+            "total_employees": len({
+                str(row.get("frappe_employee_id") or row.get("device_employee_no") or "")
+                for row in rows
+                if row.get("frappe_employee_id") or row.get("device_employee_no")
+            }),
+        },
+        "trend": sorted(trend_by_date.values(), key=lambda item: item["date"]),
+        "departments": sorted(
+            departments.values(), key=lambda item: (-item["total"], item["department"])
+        ),
+        "live": _live_attendance_payload(
+            store, frappe, feed_limit=50, refresh_frappe=False
+        ),
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+    with _dashboard_summary_lock:
+        _dashboard_summary_cache.clear()
+        _dashboard_summary_cache[cache_key] = (now, payload)
+    return dict(payload)
+
+
 def process_pending_events(store: Any, processor: EventProcessor) -> dict[str, Any]:
     """Drain queued inbound events and run retry queue. Thread-safe."""
     with _push_lock:
-        rows = store.get_pending_inbound_events()
         processed = 0
         results: dict[str, int] = {}
-        if rows:
-            logger.info("Processing %d queued inbound event(s).", len(rows))
-
-            ready_rows: list[dict[str, Any]] = []
+        candidate_db = sqlite3.connect("")
+        candidate_db.execute("PRAGMA temp_store=FILE")
+        candidate_db.execute("PRAGMA cache_size=-1024")
+        candidate_db.execute(
+            "CREATE TABLE candidates (group_key TEXT PRIMARY KEY, first_item BLOB NOT NULL, last_item BLOB)"
+        )
+        peak_in_memory_candidates = 0
+        after_id: int | None = None
+        while True:
+            rows = store.get_pending_inbound_events(
+                limit=settings.PENDING_PROCESS_BATCH_SIZE,
+                after_id=after_id,
+            )
+            if not rows:
+                break
+            after_id = int(rows[-1]["id"])
+            logger.info("Processing queued inbound batch of %d event(s).", len(rows))
             for row in rows:
                 event = _namespaced_event(row["source_node"], row["payload"])
                 result, prepared = processor.prepare_event(event)
                 if result == "ready" and prepared is not None:
-                    ready_rows.append({"row": row, "prepared": prepared})
+                    item = {"row": row, "prepared": prepared}
+                    key = (prepared["hrms_id"], prepared["event_date"])
+                    group_key = json.dumps(key, separators=(",", ":"))
+                    stored = candidate_db.execute(
+                        "SELECT first_item, last_item FROM candidates WHERE group_key = ?",
+                        (group_key,),
+                    ).fetchone()
+                    candidates = [item]
+                    if stored:
+                        candidates.append(pickle.loads(stored[0]))
+                        if stored[1] is not None:
+                            candidates.append(pickle.loads(stored[1]))
+                    peak_in_memory_candidates = max(peak_in_memory_candidates, len(candidates))
+                    candidates.sort(key=lambda candidate: punch_sort_key(candidate["prepared"]))
+                    kept = candidates if len(candidates) <= 2 else [candidates[0], candidates[-1]]
+                    kept_ids = {candidate["row"]["id"] for candidate in kept}
+                    for displaced in candidates:
+                        displaced_row = displaced["row"]
+                        if displaced_row["id"] in kept_ids:
+                            continue
+                        store.mark_inbound_processed(displaced_row["id"], "skipped_middle_punch")
+                        results["skipped_middle_punch"] = results.get("skipped_middle_punch", 0) + 1
+                        processed += 1
+                    candidate_db.execute(
+                        "INSERT OR REPLACE INTO candidates (group_key, first_item, last_item) VALUES (?, ?, ?)",
+                        (
+                            group_key,
+                            pickle.dumps(kept[0], protocol=pickle.HIGHEST_PROTOCOL),
+                            pickle.dumps(kept[1], protocol=pickle.HIGHEST_PROTOCOL) if len(kept) > 1 else None,
+                        ),
+                    )
                     continue
 
                 store.mark_inbound_processed(row["id"], result)
                 results[result] = results.get(result, 0) + 1
                 processed += 1
 
-            grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            for item in ready_rows:
-                prepared = item["prepared"]
-                key = (prepared["hrms_id"], prepared["event_date"])
-                grouped.setdefault(key, []).append(item)
+            del rows
 
-            selected_ids: set[int] = set()
-            for (_employee_id, _event_date), items in grouped.items():
-                selected = select_daily_punches(items, lambda item: item["prepared"])
-                for item, log_type, label in selected:
-                    row = item["row"]
-                    prepared = item["prepared"]
-                    selected_ids.add(row["id"])
-                    result = processor.push_prepared_event(prepared, log_type=log_type)
-                    result_key = f"{label}_{result}"
-                    store.mark_inbound_processed(row["id"], result_key)
-                    results[result_key] = results.get(result_key, 0) + 1
-                    processed += 1
-
-            for item in ready_rows:
+        candidate_db.commit()
+        for first_blob, last_blob in candidate_db.execute(
+            "SELECT first_item, last_item FROM candidates ORDER BY group_key"
+        ):
+            items = [pickle.loads(first_blob)]
+            if last_blob is not None:
+                items.append(pickle.loads(last_blob))
+            for item, log_type, label in select_daily_punches(
+                items, lambda candidate: candidate["prepared"]
+            ):
                 row = item["row"]
-                if row["id"] in selected_ids:
-                    continue
-                store.mark_inbound_processed(row["id"], "skipped_middle_punch")
-                results["skipped_middle_punch"] = results.get("skipped_middle_punch", 0) + 1
+                result = processor.push_prepared_event(item["prepared"], log_type=log_type)
+                result_key = f"{label}_{result}"
+                store.mark_inbound_processed(row["id"], result_key)
+                results[result_key] = results.get(result_key, 0) + 1
                 processed += 1
+        candidate_db.close()
 
         retries = processor.process_retries(force=True)
-        return {"processed": processed, "retries": int(retries or 0), "results": results}
+        return {
+            "processed": processed,
+            "retries": int(retries or 0),
+            "results": results,
+            "peak_in_memory_candidates": peak_in_memory_candidates,
+        }
 
 
 def run_push(store: Any, processor: EventProcessor, trigger: str) -> dict[str, Any]:
@@ -914,12 +1080,22 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         if not _request_slots.acquire(blocking=False):
             self._safe_json_response(503, {"ok": False, "error": "server_at_capacity"})
             return
+        path = urlparse(self.path).path
+        heavy_acquired = False
         try:
+            if path in _HEAVY_GET_PATHS:
+                heavy_acquired = _heavy_request_slots.acquire(blocking=False)
+                if not heavy_acquired:
+                    self._safe_json_response(503, {"ok": False, "error": "heavy_request_capacity"})
+                    return
             self._dispatch_get()
         except Exception as exc:  # noqa: BLE001
             logger.exception("Unhandled GET %s failed", self.path)
             self._safe_json_response(500, {"ok": False, "error": str(exc)})
         finally:
+            if heavy_acquired:
+                _heavy_request_slots.release()
+            self.store.close()
             _request_slots.release()
 
     def _dispatch_get(self) -> None:
@@ -976,6 +1152,16 @@ class EventIngestHandler(BaseHTTPRequestHandler):
             if not date_from and not date_to:
                 date_to = live_calendar_today()
                 date_from = (datetime.fromisoformat(date_to) - timedelta(days=_OVERVIEW_DEFAULT_DAYS)).isoformat()[:10]
+            if hasattr(self.store, "attendance_overview_page"):
+                payload = self.store.attendance_overview_page(
+                    page=page,
+                    page_size=page_size,
+                    search=search,
+                    date_from=date_from,
+                    date_to=date_to,
+                )
+                _json_response(self, 200, payload)
+                return
             all_rows = self.store.attendance_overview(limit=None, date_from=date_from or None, date_to=date_to or None)
             filtered_rows = _filter_attendance_overview(all_rows, search, date_from, date_to)
             total = len(filtered_rows)
@@ -1000,8 +1186,78 @@ class EventIngestHandler(BaseHTTPRequestHandler):
             search = (query.get("search") or [""])[0].strip()
             date_from = (query.get("from") or [""])[0].strip()
             date_to = (query.get("to") or [""])[0].strip()
+            status = (query.get("status") or [""])[0].strip()
+            department = (query.get("department") or [""])[0].strip()
             late_after = (query.get("late_after") or [settings.LATE_AFTER_TIME])[0].strip()
             refresh_frappe = (query.get("refresh_frappe") or [""])[0].lower() in {"1", "true", "yes"}
+            if not date_from and not date_to:
+                date_to = live_calendar_today()
+                date_from = (datetime.fromisoformat(date_to) - timedelta(days=_OVERVIEW_DEFAULT_DAYS)).isoformat()[:10]
+            if hasattr(self.store, "attendance_overview_page"):
+                employee_map = settings.load_employee_map()
+                all_details, _ = _load_frappe_employee_details(
+                    self.frappe,
+                    list(employee_map.values()),
+                    refresh=refresh_frappe,
+                )
+                eligible_employee_ids: list[str] | None = None
+                if department:
+                    department_text = department.casefold()
+                    eligible_employee_ids = [
+                        device_id for device_id, frappe_id in employee_map.items()
+                        if str(all_details.get(frappe_id, {}).get("department") or "").casefold() == department_text
+                    ]
+                search_employee_ids: list[str] = []
+                if search:
+                    search_text = search.casefold()
+                    for device_id, frappe_id in employee_map.items():
+                        details = all_details.get(frappe_id, {})
+                        haystack = " ".join(str(value or "") for value in (
+                            device_id, frappe_id, details.get("employee_name"),
+                            details.get("department"), details.get("designation"),
+                            details.get("branch"), details.get("status"),
+                        )).casefold()
+                        if search_text in haystack:
+                            search_employee_ids.append(device_id)
+                source_page = self.store.attendance_overview_page(
+                    page=page,
+                    page_size=page_size,
+                    search=search,
+                    date_from=date_from,
+                    date_to=date_to,
+                    status=status,
+                    late_after=_late_threshold_minutes(late_after)[0],
+                    eligible_employee_ids=eligible_employee_ids,
+                    search_employee_ids=search_employee_ids,
+                )
+                rows, summary = _hr_verification_rows(
+                    self.store,
+                    self.frappe,
+                    search="",
+                    date_from=date_from,
+                    date_to=date_to,
+                    late_after=late_after,
+                    refresh_frappe=refresh_frappe,
+                    overview_rows=source_page["overview"],
+                )
+                if hasattr(self.store, "attendance_overview_summary"):
+                    summary.update(self.store.attendance_overview_summary(
+                        date_from=date_from,
+                        date_to=date_to,
+                        late_after=_late_threshold_minutes(late_after)[0],
+                        mapped_employees=list(employee_map),
+                    ))
+                summary["total"] = source_page["total"]
+                _json_response(self, 200, {
+                    "rows": rows,
+                    "summary": summary,
+                    "page": page,
+                    "page_size": page_size,
+                    "total": source_page["total"],
+                    "has_next": source_page["has_next"],
+                    "has_prev": source_page["has_prev"],
+                })
+                return
             all_rows, summary = _hr_verification_rows(
                 self.store,
                 self.frappe,
@@ -1011,6 +1267,24 @@ class EventIngestHandler(BaseHTTPRequestHandler):
                 late_after=late_after,
                 refresh_frappe=refresh_frappe,
             )
+            normalized_status = status.lower()
+            if normalized_status:
+                accepted_statuses = {
+                    "late": {"late"},
+                    "present": {"on_time"},
+                    "on_time": {"on_time"},
+                    "absent": {"missing_first_punch"},
+                    "missing_first_punch": {"missing_first_punch"},
+                }.get(normalized_status, {normalized_status})
+                all_rows = [
+                    row for row in all_rows
+                    if row.get("late_status") in accepted_statuses
+                ]
+            if department:
+                all_rows = [
+                    row for row in all_rows
+                    if str(row.get("department") or "").casefold() == department.casefold()
+                ]
             total = len(all_rows)
             start = (page - 1) * page_size
             end = start + page_size
@@ -1026,6 +1300,19 @@ class EventIngestHandler(BaseHTTPRequestHandler):
                     "has_next": end < total,
                     "has_prev": page > 1,
                 },
+            )
+            return
+        if path == "/api/dashboard-summary":
+            date_from = (query.get("from") or [""])[0].strip()
+            date_to = (query.get("to") or [""])[0].strip()
+            if not date_to:
+                date_to = live_calendar_today()
+            if not date_from:
+                date_from = (datetime.fromisoformat(date_to) - timedelta(days=30)).isoformat()[:10]
+            _json_response(
+                self,
+                200,
+                _dashboard_summary_payload(self.store, self.frappe, date_from, date_to),
             )
             return
         if path == "/api/live-attendance":
@@ -1078,6 +1365,7 @@ class EventIngestHandler(BaseHTTPRequestHandler):
             logger.exception("Unhandled POST %s failed", self.path)
             self._safe_json_response(500, {"ok": False, "error": str(exc)})
         finally:
+            self.store.close()
             _request_slots.release()
 
     def _dispatch_post(self) -> None:
@@ -1107,9 +1395,28 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             logger.debug("HTTP client disconnected before error response was sent")
 
+    def _read_request_body(self) -> bytes | None:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length or "0")
+        except ValueError:
+            _json_response(self, 400, {"error": "invalid_content_length"})
+            return None
+        if length < 0:
+            _json_response(self, 400, {"error": "invalid_content_length"})
+            return None
+        if length > settings.SERVER_MAX_REQUEST_BODY_BYTES:
+            _json_response(self, 413, {
+                "error": "request_body_too_large",
+                "max_bytes": settings.SERVER_MAX_REQUEST_BODY_BYTES,
+            })
+            return None
+        return self.rfile.read(length)
+
     def _handle_config_post(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
+        raw = self._read_request_body()
+        if raw is None:
+            return
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
         except json.JSONDecodeError:
@@ -1144,8 +1451,9 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_employee_map_post(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length)
+        raw = self._read_request_body()
+        if raw is None:
+            return
         try:
             body = json.loads(raw.decode("utf-8")) if raw else {}
         except json.JSONDecodeError:
@@ -1192,8 +1500,9 @@ class EventIngestHandler(BaseHTTPRequestHandler):
     # ── handlers ─────────────────────────────────────────────────────────────
 
     def _handle_events_post(self) -> None:
-        content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length)
+        body = self._read_request_body()
+        if body is None:
+            return
 
         node_id = self.headers.get(NODE_HEADER, "")
         timestamp = self.headers.get(TIMESTAMP_HEADER, "")
@@ -1218,6 +1527,12 @@ class EventIngestHandler(BaseHTTPRequestHandler):
         events = payload.get("events")
         if not isinstance(events, list):
             _json_response(self, 400, {"error": "events_must_be_list"})
+            return
+        if len(events) > settings.SERVER_MAX_EVENT_BATCH_SIZE:
+            _json_response(self, 413, {
+                "error": "event_batch_too_large",
+                "max_events": settings.SERVER_MAX_EVENT_BATCH_SIZE,
+            })
             return
 
         safe_events = [event for event in events if isinstance(event, dict)]
