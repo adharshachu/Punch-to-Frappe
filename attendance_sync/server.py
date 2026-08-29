@@ -1653,6 +1653,7 @@ def create_processor(store: Any) -> tuple[FrappeClient, EventProcessor]:
 
 
 def main() -> None:
+    global _running
     _setup_logging()
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
